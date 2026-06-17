@@ -1,15 +1,11 @@
 {
     "baselines": [
         ["src.players.TA.public_baselines2", "Baseline10", {}, "B10"],
-        ["src.players.TA.public_baselines2", "Baseline10", {}, "B10"],
-        ["src.players.TA.public_baselines2", "Baseline10", {}, "B10"],
         ["src.players.TA.public_baselines2", "Baseline10", {}, "B10"]
     ],
     "players": [
-        ["src.players.b13902057.exp2", "Exp2", {"mode": "greedy"}, "greedy"],
-        ["src.players.b13902057.exp", "Exp", {"depth": 1, "objective": "rank", "budget": 0.82}, "exp_d1"],
-        ["src.players.b13902057.exp", "Exp", {"depth": 2, "objective": "rank", "budget": 0.82}, "exp_d2"],
-        ["src.players.b13902057.mcts", "MCTS", {"c": 0.4, "root_k": 8, "final": "mean", "reward": "rank", "n_det": 128, "budget": 0.82, "hard_cap": 0.90}, "mcts"]
+        ["src.players.b13902057.player2", "player2", {}, "player2"],
+        ["src.players.b13902057.player4", "player4", {}, "player4"]
     ],
     "engine": {
         "n_players": 4,
