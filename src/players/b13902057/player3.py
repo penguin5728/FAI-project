@@ -12,29 +12,67 @@ class _Node:
 		self.children = {}
 
 
-class MCTS:
-	"""Determinized Information-Set MCTS for 6 Nimmt!.
+class player3:
+	"""Determinized Information-Set MCTS agent for 6 Nimmt! (rank-min).
 
-	Each iteration: (1) determinize the hidden opponent hands by dealing the
-	unseen pool, (2) descend a tree keyed by *our* card sequence using UCB1,
-	with opponents playing the fast greedy policy and rounds resolved exactly
-	like the engine, (3) greedy-rollout to game end, (4) backprop the rank we
-	achieved. Move chosen = most-visited root child (robust). All knobs are
-	constructor args so the agent can be hyperparameter-tuned.
+	The tournament scores by *rank*, and opponents' hands are hidden, so each
+	search iteration:
+	  1. determinizes the hidden opponent hands by dealing the unseen pool
+	     (which also holds the never-dealt cards -- genuine, correct
+	     uncertainty),
+	  2. descends a tree keyed by *our own* card sequence using UCB1, with
+	     opponents playing a fast greedy policy and every round resolved
+	     exactly like the engine (sum-cached, never re-summed),
+	  3. greedy-rolls out the remaining cards to game end,
+	  4. backpropagates the normalized rank we achieved.
+	The chosen move is the most-visited root child (robust), or best-mean if
+	configured.
+
+	Every knob is a constructor argument with a default, so the agent is
+	directly hyperparameter-swept from the tournament config's ``args`` dict
+	(the engine instantiates ``player3(player_idx=..., **args)``). Defaults
+	form a sane standalone player; the sweep just overrides them.
+
+	Knobs:
+	  c        -- UCB exploration constant.
+	  root_k   -- branching cap: only the top-k engine-greedy cards expanded.
+	  budget   -- wall-clock seconds before stopping new iterations.
+	  hard_cap -- absolute wall-clock guard against the 1.0s timeout.
+	  reward   -- 'rank' (default): normalized seat rank, the tournament metric
+	              -- empirically the strongest objective here. 'blend': convex
+	              mix of rank and a normalized bullhead-penalty reward (a large
+	              penalty weight regressed in testing, so blend defaults low and
+	              is a sweep knob). 'pen': bullhead penalty only.
+	  blend    -- weight on the penalty term in 'blend' (0 = pure rank,
+	              1 = pure penalty).
+	  pen_scale-- bullhead count mapped to reward 0 (penalties >= this clamp).
+	  n_det    -- size of the common-random-number determinization pool
+	              reused round-robin so sibling moves share opponent deals
+	              (0 = fresh deal every iteration).
+	  final    -- 'visit' (most-visited child) or 'mean' (best mean reward).
+	  self_bull_w -- weight (0..1) on our own card's bullheads in the safe-fit
+	              risk of the base heuristic `_eval`. 1.0 = original; lower
+	              values stop over-penalizing safely offloading big cards.
+	  iters    -- >0 forces a fixed iteration count (deterministic, for
+	              reproducible tuning); 0 uses the wall-clock budget.
+	  seed     -- RNG seed offset for determinization.
 	"""
 
-	def __init__(self, player_idx, c=0.6, root_k=10, budget=0.90,
-	             hard_cap=0.95, reward='rank', n_det=64, final='visit',
-	             iters=0, seed=0):
+	def __init__(self, player_idx, c=0.6, root_k=10, budget=0.85,
+	             hard_cap=0.90, reward='rank', blend=0.5, pen_scale=33.0,
+	             n_det=64, final='visit', self_bull_w=1.0, iters=0, seed=0):
 		self.player_idx = player_idx
 		self.c = c
 		self.root_k = root_k
 		self.TIME_BUDGET = budget
 		self.HARD_CAP = hard_cap
 		self.reward = reward
-		self.n_det = n_det          # CRN determinization pool size (0 = fresh each iter)
-		self.final = final          # 'visit' (most-visited) or 'mean' (best mean)
-		self.iters = iters          # >0: fixed iteration count (deterministic, for tuning)
+		self.blend = blend
+		self.pen_scale = pen_scale
+		self.n_det = n_det
+		self.final = final
+		self.sbw = self_bull_w
+		self.iters = iters
 		self.bull = [0] + [self._bullheads(c) for c in range(1, 105)]
 		self.rng = random.Random(2654435761 * (player_idx + 1) + seed)
 
@@ -70,7 +108,12 @@ class MCTS:
 		if len(rows[best]) >= 5:
 			return sums[best] * 10.0
 		new_len = len(rows[best]) + 1
-		rv = bull[card] + sums[best]
+		# Safe fit: immediate cost 0; estimate the row's future take-risk.
+		# Our own card's bullheads are charged only at weight `sbw` (< 1): if we
+		# never take this row those bullheads hurt whoever does, so penalizing a
+		# safe offload of a big card at full weight is wrong. sbw=1.0 recovers
+		# the original heuristic.
+		rv = sums[best] + bull[card] * self.sbw
 		return rv * (new_len / 5.0) ** 2 + (card - rows[best][-1]) * 0.01
 
 	def _place(self, rows, sums, card, bull):
@@ -117,6 +160,7 @@ class MCTS:
 		scored.sort()
 		return [c for _, c in scored[:k]]
 
+	# --- one round: mutate rows/sums/my/opp, return seat penalties ------
 	def _sim_round(self, rows, sums, my, opp, mc, bull):
 		my.remove(mc)
 		n_opp = len(opp)
@@ -181,6 +225,8 @@ class MCTS:
 		c_uct = self.c
 		root_k = self.root_k
 		reward_mode = self.reward
+		blend = self.blend
+		pen_scale = self.pen_scale
 		deadline = t0 + self.TIME_BUDGET
 		hard = t0 + self.HARD_CAP
 		perf = time.perf_counter
@@ -271,8 +317,10 @@ class MCTS:
 
 			# 4. reward + backprop
 			mine = my_score + my_pen
+			# normalized penalty reward in [0, 1]: fewer bullheads -> higher.
+			pen_r = 1.0 - (my_pen if my_pen < pen_scale else pen_scale) / pen_scale
 			if reward_mode == 'pen':
-				r = 1.0 / (1.0 + my_pen)
+				r = pen_r
 			else:
 				rank = 1.0
 				for k in range(n_opp):
@@ -281,7 +329,11 @@ class MCTS:
 						rank += 1.0
 					elif o == mine:
 						rank += 0.5
-				r = (n_tot - rank) / (n_tot - 1)
+				rank_r = (n_tot - rank) / (n_tot - 1)
+				if reward_mode == 'blend':
+					r = (1.0 - blend) * rank_r + blend * pen_r
+				else:
+					r = rank_r
 			for nd in path:
 				nd.N += 1
 				nd.W += r

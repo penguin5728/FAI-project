@@ -13,20 +13,17 @@ class _Node:
 		self.children = {}
 
 
-class player2:
+class player4:
 	"""Determinized IS-MCTS with a gap-trap-aware rollout policy (rank-min).
-
-	(Snapshot of the gap-aware player4; kept here as a stable strong agent while
-	player4 stays open for further experiments.)
 
 	Same proven search skeleton as player3 -- determinize the hidden opponent
 	hands, descend a UCB1 tree keyed by our own card sequence, greedy-roll to
 	game end, backprop the normalized rank -- but with a stronger base policy
 	`_eval`. player3's policy only saw the "gap trap" through a negligible
-	0.01-weighted term; player2 adds the real thing: because a round resolves
+	0.01-weighted term; player4 adds the real thing: because a round resolves
 	low-to-high, any unseen card in the gap between a row's end and the card we
 	place can be played by an opponent *first*, and if enough land there the
-	row fills and our card becomes the trapped sixth. player2 charges the exact
+	row fills and our card becomes the trapped sixth. player4 charges the exact
 	binomial probability of that (over how many unseen cards sit in the gap and
 	how many opponents could place there) times the row's bullheads.
 
@@ -36,16 +33,19 @@ class player2:
 	(it runs ~15k sims/move, so it was never sim-starved; the ceiling was
 	policy/opponent-model quality, not search quantity).
 
-	Knobs mirror player3 plus ``gap_w`` (weight on the gap-trap term; 0 recovers
-	player3's policy exactly). A moderate gap_w (~1.0) helps against the
-	baselines; large values over-avoid and regress. All are constructor args,
-	so they sweep from the config ``args`` dict.
+	Knobs mirror player3 plus ``gap_w`` (gap-trap weight for OUR moves; 0
+	recovers player3's policy) and ``opp_gap_w`` (gap-trap weight for the
+	SIMULATED opponents; default 0 = an asymmetric model where we dodge the gap
+	trap but the modelled opponents play plain greedy, which is more faithful to
+	real baselines that don't avoid it). Set ``opp_gap_w == gap_w`` for the
+	symmetric model (that is exactly what player2 snapshots). All are
+	constructor args, so they sweep from the config ``args`` dict.
 	"""
 
 	def __init__(self, player_idx, c=0.6, root_k=10, budget=0.85,
 	             hard_cap=0.90, reward='rank', blend=0.5, pen_scale=33.0,
 	             n_det=64, final='visit', self_bull_w=1.0, gap_w=1.0,
-	             iters=0, seed=0):
+	             opp_gap_w=0.0, iters=0, seed=0):
 		self.player_idx = player_idx
 		self.c = c
 		self.root_k = root_k
@@ -58,6 +58,11 @@ class player2:
 		self.final = final
 		self.sbw = self_bull_w
 		self.gap_w = gap_w
+		# Gap weight used when modelling the SIMULATED opponents. Default 0
+		# (plain greedy) -- real opponents do not avoid the gap trap the way we
+		# do, so an asymmetric model (we avoid it, they don't) is more faithful
+		# than charging them our own caution. Set == gap_w for a symmetric model.
+		self.opp_gap_w = opp_gap_w
 		self.iters = iters
 		self.bull = [0] + [self._bullheads(c) for c in range(1, 105)]
 		self.rng = random.Random(2654435761 * (player_idx + 1) + seed)
@@ -92,7 +97,7 @@ class player2:
 		return s
 
 	# --- sum-cached engine-faithful primitives -------------------------
-	def _eval(self, rows, sums, card, bull):
+	def _eval(self, rows, sums, card, bull, gw):
 		best, best_last = -1, -1
 		for i in range(len(rows)):
 			last = rows[i][-1]
@@ -115,7 +120,8 @@ class player2:
 		rv = (sums[best] + bull[card] * self.sbw) * (new_len / 5.0) ** 2
 		# Gap-trap: expected loss if opponents fill (best_last, card) before our
 		# card resolves, making ours the trapped 6th. slots = cards needed.
-		gw = self.gap_w
+		# `gw` is the gap weight for whoever is choosing this card (us vs a
+		# simulated opponent), so the model can be asymmetric.
 		if gw > 0.0 and self._nU > 0:
 			slots = 5 - L
 			if slots <= self._n_opp:
@@ -153,30 +159,31 @@ class player2:
 		sums[bi] = bull[card]
 		return pen
 
-	def _greedy(self, rows, sums, hand, bull):
+	def _greedy(self, rows, sums, hand, bull, gw):
 		best_card = hand[0]
 		best = None
 		for c in hand:
-			s = self._eval(rows, sums, c, bull)
+			s = self._eval(rows, sums, c, bull, gw)
 			if best is None or s < best:
 				best = s
 				best_card = c
 		return best_card
 
-	def _topk(self, hand, rows, sums, bull, k):
+	def _topk(self, hand, rows, sums, bull, k, gw):
 		if len(hand) <= k:
 			return list(hand)
-		scored = [(self._eval(rows, sums, c, bull), c) for c in hand]
+		scored = [(self._eval(rows, sums, c, bull, gw), c) for c in hand]
 		scored.sort()
 		return [c for _, c in scored[:k]]
 
 	def _sim_round(self, rows, sums, my, opp, mc, bull):
 		my.remove(mc)
 		n_opp = len(opp)
+		opp_gw = self.opp_gap_w
 		pens = [0] * (n_opp + 1)
 		plays = [(mc, 0)]
 		for k in range(n_opp):
-			oc = self._greedy(rows, sums, opp[k], bull)
+			oc = self._greedy(rows, sums, opp[k], bull, opp_gw)
 			opp[k].remove(oc)
 			plays.append((oc, k + 1))
 		plays.sort()
@@ -186,9 +193,10 @@ class player2:
 
 	def _greedy_tail(self, rows, sums, my, opp, bull):
 		n_opp = len(opp)
+		my_gw = self.gap_w
 		pens = [0] * (n_opp + 1)
 		for _ in range(len(my)):
-			mc = self._greedy(rows, sums, my, bull)
+			mc = self._greedy(rows, sums, my, bull, my_gw)
 			pr = self._sim_round(rows, sums, my, opp, mc, bull)
 			for i in range(n_opp + 1):
 				pens[i] += pr[i]
@@ -225,9 +233,10 @@ class player2:
 		self._nU = len(unseen)
 		self._n_opp = n_opp
 
+		my_gw = self.gap_w
 		if n_opp == 0:
-			cands = self._topk(hand, rows0, sums0, bull, self.root_k)
-			return min(cands, key=lambda c: (self._eval(rows0, sums0, c, bull), -c))
+			cands = self._topk(hand, rows0, sums0, bull, self.root_k, my_gw)
+			return min(cands, key=lambda c: (self._eval(rows0, sums0, c, bull, my_gw), -c))
 
 		my_score = scores[self.player_idx]
 		opp_scores = [scores[i] for i in range(len(scores)) if i != self.player_idx]
@@ -282,7 +291,7 @@ class player2:
 			node = root
 			path = [root]
 			while my:
-				cands = self._topk(my, rows, sums, bull, root_k)
+				cands = self._topk(my, rows, sums, bull, root_k, my_gw)
 				children = node.children
 				untried = None
 				for c in cands:
@@ -358,5 +367,5 @@ class player2:
 				best_key = key
 				best_card = c
 		if best_card is None:
-			return min(hand, key=lambda c: self._eval(rows0, sums0, c, bull))
+			return min(hand, key=lambda c: self._eval(rows0, sums0, c, bull, my_gw))
 		return best_card
